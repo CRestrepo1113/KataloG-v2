@@ -4,7 +4,7 @@ import { fetchBranches } from '@/lib/firestore';
 export const dynamic = 'force-static';
 
 export default async function manifest(): Promise<MetadataRoute.Manifest> {
-  let branchShortcuts: any[] = [];
+  let branchShortcuts: NonNullable<MetadataRoute.Manifest['shortcuts']> = [];
   try {
     const branches = await fetchBranches();
     branchShortcuts = branches
@@ -41,7 +41,7 @@ export default async function manifest(): Promise<MetadataRoute.Manifest> {
         type: 'image/png',
       },
       {
-        src: '/icon-512.png',
+        src: '/icon-512-maskable.png',
         sizes: '512x512',
         type: 'image/png',
         purpose: 'maskable',
