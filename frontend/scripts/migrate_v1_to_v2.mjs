@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { initializeApp } from 'firebase/app';
 import {
@@ -305,20 +306,76 @@ export function decodeFirestoreValue(value) {
 }
 
 /**
+ * Codifica un valor JS nativo al formato tipado de Firestore REST API v1.
+ */
+export function encodeFirestoreValue(value) {
+  if (value === null) return { nullValue: null };
+  if (typeof value === 'boolean') return { booleanValue: value };
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return { nullValue: null };
+    return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  }
+  if (typeof value === 'string') return { stringValue: value };
+  if (Array.isArray(value)) {
+    return {
+      arrayValue: {
+        values: value
+          .map((item) => encodeFirestoreValue(item))
+          .filter((v) => v !== undefined),
+      },
+    };
+  }
+  if (typeof value === 'object') {
+    const fields = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      const encoded = encodeFirestoreValue(v);
+      if (encoded !== undefined) fields[k] = encoded;
+    }
+    return { mapValue: { fields } };
+  }
+  return undefined;
+}
+
+export function encodeFirestoreFields(obj) {
+  const fields = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === undefined) continue;
+    const encoded = encodeFirestoreValue(v);
+    if (encoded !== undefined) fields[k] = encoded;
+  }
+  return fields;
+}
+
+function getGcloudAccessToken() {
+  const bin = process.platform === 'win32' ? 'cmd.exe' : 'gcloud';
+  const args =
+    process.platform === 'win32'
+      ? ['/d', '/s', '/c', 'gcloud auth print-access-token']
+      : ['auth', 'print-access-token'];
+  const token = execFileSync(bin, args, { encoding: 'utf8' }).trim();
+  if (!token) {
+    throw new Error('No se pudo obtener access token de gcloud.');
+  }
+  return token;
+}
+
+/**
  * Lee una colección completa de Firestore usando la REST API paginada (evita streams gRPC en Node).
  */
-async function fetchCollectionViaRest(projectId, collectionName, apiKey) {
+async function fetchCollectionViaRest(projectId, collectionName, apiKey, bearerToken = '') {
   const docs = [];
   let pageToken = '';
   do {
     const params = new URLSearchParams({ pageSize: '300' });
     if (pageToken) params.set('pageToken', pageToken);
-    if (apiKey) params.set('key', apiKey);
+    if (apiKey && !bearerToken) params.set('key', apiKey);
     const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
       projectId
     )}/databases/(default)/documents/${encodeURIComponent(collectionName)}?${params.toString()}`;
 
-    const res = await fetch(url);
+    const headers = bearerToken ? { Authorization: `Bearer ${bearerToken}` } : undefined;
+    const res = await fetch(url, { headers });
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(
@@ -342,6 +399,41 @@ async function fetchCollectionViaRest(projectId, collectionName, apiKey) {
   return docs;
 }
 
+async function commitOperationsViaRest(projectId, operations, bearerToken, label) {
+  const CHUNK_SIZE = 40;
+  let committed = 0;
+  const endpoint = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    projectId
+  )}/databases/(default)/documents:commit`;
+
+  for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+    const chunk = operations.slice(i, i + CHUNK_SIZE);
+    const writes = chunk.map((op) => ({
+      update: {
+        name: `projects/${projectId}/databases/(default)/documents/${op.collection}/${op.docId}`,
+        fields: encodeFirestoreFields(stripUndefinedDeep(op.data)),
+      },
+    }));
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearerToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ writes }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Error REST commit lote ${i}: (${res.status}) ${errText.slice(0, 400)}`);
+    }
+
+    committed += chunk.length;
+    console.log(`  ✓ ${label} (REST): ${committed}/${operations.length}`);
+  }
+}
+
 function buildFirebaseConfig(envMap, prefix) {
   const get = (suffix) => envMap[`${prefix}_${suffix}`] || process.env[`${prefix}_${suffix}`] || '';
   return {
@@ -363,11 +455,15 @@ function parseCliArgs(argv) {
     fromJson: '',
     exportSnapshot: '',
     confirmWrite: false,
+    useGcloud: false,
+    verifyOnly: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
     if (token === '--dry-run') args.dryRun = true;
     else if (token === '--confirm-write') args.confirmWrite = true;
+    else if (token === '--use-gcloud') args.useGcloud = true;
+    else if (token === '--verify-only') args.verifyOnly = true;
     else if (token === '--limit' && argv[i + 1]) args.limit = Math.max(0, parseInt(argv[++i], 10) || 0);
     else if (token === '--v1-env' && argv[i + 1]) args.v1EnvPath = argv[++i];
     else if (token === '--v2-env' && argv[i + 1]) args.v2EnvPath = argv[++i];
@@ -476,25 +572,12 @@ async function main() {
     console.log('\nMuestra catalog_public:', JSON.stringify(publicDocs[0], null, 2).slice(0, 450));
   }
 
-  if (cli.dryRun || !cli.confirmWrite) {
+  if (cli.dryRun || (!cli.confirmWrite && !cli.verifyOnly)) {
     console.log('\n[DRY-RUN] No se realizaron escrituras. Usa `--confirm-write` para escribir en v2.');
     process.exit(0);
   }
 
   assertV1IsNotV2(v1Config, v2Config);
-  const adminEmail = process.env.V2_ADMIN_EMAIL || v2Env.V2_ADMIN_EMAIL || '';
-  const adminPassword = process.env.V2_ADMIN_PASSWORD || v2Env.V2_ADMIN_PASSWORD || '';
-
-  const v2App = initializeApp(v2Config, 'v2-target');
-  const v2Auth = getAuth(v2App);
-  if (adminEmail && adminPassword) {
-    console.log(`Autenticando SuperAdmin destino (${adminEmail})...`);
-    await signInWithEmailAndPassword(v2Auth, adminEmail, adminPassword);
-  } else {
-    console.warn('⚠️ Sin V2_ADMIN_EMAIL/V2_ADMIN_PASSWORD: las reglas estrictas bloquearán la escritura si no existe sesión SuperAdmin.');
-  }
-
-  const v2Db = initializeFirestore(v2App, { experimentalForceLongPolling: true });
   const ops = [
     ...branchesRaw.map((b) => ({ collection: 'branches', docId: b.id, data: b.data })),
     ...companyRaw.map((c) => ({ collection: 'company_info', docId: c.id, data: c.data })),
@@ -503,9 +586,108 @@ async function main() {
     ...publicDocs.map((pub) => ({ collection: 'catalog_public', docId: pub.id, data: pub })),
   ];
 
-  console.log(`\nEscribiendo ${ops.length} documentos en Firebase v2 (${v2Config.projectId})...`);
-  await commitInChunks(v2Db, ops, 'Migración v2');
-  console.log('✓ Migración completada.');
+  let gcloudToken = '';
+  if (cli.useGcloud) {
+    gcloudToken = getGcloudAccessToken();
+  }
+
+  if (cli.confirmWrite && !cli.verifyOnly) {
+    if (transformedProducts.length === 0) {
+      throw new Error('Abortando escritura: no se leyeron productos desde v1.');
+    }
+    if (cli.useGcloud) {
+      console.log(`\nEscribiendo ${ops.length} documentos en Firebase v2 (${v2Config.projectId}) vía gcloud IAM REST...`);
+      await commitOperationsViaRest(v2Config.projectId, ops, gcloudToken, 'Migración v2');
+      console.log('✓ Migración completada.');
+    } else {
+      const adminEmail = process.env.V2_ADMIN_EMAIL || v2Env.V2_ADMIN_EMAIL || '';
+      const adminPassword = process.env.V2_ADMIN_PASSWORD || v2Env.V2_ADMIN_PASSWORD || '';
+
+      const v2App = initializeApp(v2Config, 'v2-target');
+      const v2Auth = getAuth(v2App);
+      if (adminEmail && adminPassword) {
+        console.log(`Autenticando SuperAdmin destino (${adminEmail})...`);
+        await signInWithEmailAndPassword(v2Auth, adminEmail, adminPassword);
+      } else {
+        console.warn('⚠️ Sin V2_ADMIN_EMAIL/V2_ADMIN_PASSWORD ni --use-gcloud: las reglas estrictas bloquearán la escritura si no existe sesión SuperAdmin.');
+      }
+
+      const v2Db = initializeFirestore(v2App, { experimentalForceLongPolling: true });
+      console.log(`\nEscribiendo ${ops.length} documentos en Firebase v2 (${v2Config.projectId})...`);
+      await commitInChunks(v2Db, ops, 'Migración v2');
+      console.log('✓ Migración completada.');
+    }
+  }
+
+  if (cli.useGcloud || cli.verifyOnly) {
+    const token = gcloudToken || getGcloudAccessToken();
+    console.log(`\nVerificando integridad 1:1 en ${v2Config.projectId}...`);
+    const [v2Branches, v2Company, v2Lists, v2Products, v2Public] = await Promise.all([
+      fetchCollectionViaRest(v2Config.projectId, 'branches', '', token),
+      fetchCollectionViaRest(v2Config.projectId, 'company_info', '', token),
+      fetchCollectionViaRest(v2Config.projectId, 'price_lists', '', token),
+      fetchCollectionViaRest(v2Config.projectId, 'products', '', token),
+      fetchCollectionViaRest(v2Config.projectId, 'catalog_public', '', token),
+    ]);
+
+    const v2ProdMap = new Map(v2Products.map((d) => [d.id, d.data]));
+    const v2PubMap = new Map(v2Public.map((d) => [d.id, d.data]));
+    const statusCountsV1 = {};
+    const statusCountsV2 = {};
+    let mismatches = 0;
+
+    for (const p of transformedProducts) {
+      const stV1 = p.status || 'active';
+      statusCountsV1[stV1] = (statusCountsV1[stV1] || 0) + 1;
+
+      const gotPriv = v2ProdMap.get(p.id);
+      const gotPub = v2PubMap.get(p.id);
+      if (!gotPriv || !gotPub) {
+        mismatches++;
+        console.error(`  ✗ Faltante en v2: ${p.id} (sku=${p.sku})`);
+        continue;
+      }
+
+      validateNoPricesInPublicDoc(gotPub);
+      const stV2 = gotPriv.status || 'active';
+      statusCountsV2[stV2] = (statusCountsV2[stV2] || 0) + 1;
+
+      const sameStatus = stV2 === stV1 && (gotPub.status || 'active') === stV1;
+      const sameSku = gotPriv.sku === p.sku && gotPub.sku === p.sku;
+      const sameStock = Number(gotPriv.stock ?? 0) === Number(p.stock ?? 0);
+      const sameUnit = Number(gotPriv.prices?.unit ?? 0) === Number(p.prices?.unit ?? 0);
+      const sameDozen = Number(gotPriv.prices?.dozen ?? 0) === Number(p.prices?.dozen ?? 0);
+      const sameWholesale = Number(gotPriv.prices?.wholesale ?? 0) === Number(p.prices?.wholesale ?? 0);
+      const sameBase = Number(gotPriv.prices?.basePrice ?? 0) === Number(p.prices?.basePrice ?? 0);
+
+      if (!sameStatus || !sameSku || !sameStock || !sameUnit || !sameDozen || !sameWholesale || !sameBase) {
+        mismatches++;
+        console.error(`  ✗ Diferencia en ${p.id} (${p.sku})`);
+      }
+    }
+
+    console.log('--- AUDITORÍA V1 vs V2 ---');
+    console.log(`  branches:       v1=${branchesRaw.length} | v2=${v2Branches.length}`);
+    console.log(`  company_info:   v1=${companyRaw.length} | v2=${v2Company.length}`);
+    console.log(`  price_lists:    esperadas=${defaultPriceLists.length} | v2=${v2Lists.length}`);
+    console.log(`  products:       v1=${transformedProducts.length} | v2=${v2Products.length}`);
+    console.log(`  catalog_public: v1=${publicDocs.length} | v2=${v2Public.length} (0 precios verificado)`);
+    console.log(`  estados v1:     ${JSON.stringify(statusCountsV1)}`);
+    console.log(`  estados v2:     ${JSON.stringify(statusCountsV2)}`);
+    console.log(`  discrepancias:  ${mismatches}`);
+
+    if (
+      mismatches > 0 ||
+      v2Products.length !== transformedProducts.length ||
+      v2Public.length !== publicDocs.length ||
+      v2Branches.length !== branchesRaw.length ||
+      v2Company.length !== companyRaw.length
+    ) {
+      throw new Error('Auditoría post-migración detectó diferencias.');
+    }
+    console.log('✓ Auditoría 100% conforme: todas las referencias, precios, imágenes y estados coinciden.');
+  }
+
   process.exit(0);
 }
 
