@@ -10,6 +10,7 @@ import {
   validateNoPricesInPublicDoc,
   buildDefaultPriceListsForBranches,
   assertV1IsNotV2,
+  decodeFirestoreValue,
 } from '../../scripts/migrate_v1_to_v2.mjs';
 
 test('migrate_v1_to_v2 transforma productos v1 y garantiza catalog_public sin precios', () => {
@@ -82,4 +83,28 @@ test('CLI migrate_v1_to_v2.mjs --dry-run --from-json ejecuta extremo a extremo s
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('decodeFirestoreValue decodifica correctamente tipos REST v1 de Firestore', () => {
+  const decoded = decodeFirestoreValue({
+    mapValue: {
+      fields: {
+        sku: { stringValue: '2603-173 CR' },
+        stock: { integerValue: '50' },
+        ratio: { doubleValue: 1.25 },
+        active: { booleanValue: true },
+        empty: { nullValue: null },
+        tags: { arrayValue: { values: [{ stringValue: 'osos' }] } },
+      },
+    },
+  });
+
+  assert.deepEqual(decoded, {
+    sku: '2603-173 CR',
+    stock: 50,
+    ratio: 1.25,
+    active: true,
+    empty: null,
+    tags: ['osos'],
+  });
 });

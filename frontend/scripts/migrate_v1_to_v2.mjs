@@ -3,9 +3,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { initializeApp } from 'firebase/app';
 import {
-  getFirestore,
-  collection,
-  getDocs,
+  initializeFirestore,
   writeBatch,
   doc,
 } from 'firebase/firestore';
@@ -278,6 +276,72 @@ export function assertV1IsNotV2(v1Config, v2Config) {
   }
 }
 
+/**
+ * Convierte un valor tipado de Firestore REST API v1 a JS nativo.
+ */
+export function decodeFirestoreValue(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  if ('nullValue' in value) return null;
+  if ('booleanValue' in value) return Boolean(value.booleanValue);
+  if ('integerValue' in value) return Number(value.integerValue);
+  if ('doubleValue' in value) return Number(value.doubleValue);
+  if ('stringValue' in value) return String(value.stringValue);
+  if ('timestampValue' in value) return String(value.timestampValue);
+  if ('referenceValue' in value) return String(value.referenceValue);
+  if ('arrayValue' in value) {
+    const arr = Array.isArray(value.arrayValue?.values) ? value.arrayValue.values : [];
+    return arr.map((item) => decodeFirestoreValue(item));
+  }
+  if ('mapValue' in value) {
+    const out = {};
+    const fields = value.mapValue?.fields || {};
+    for (const [k, v] of Object.entries(fields)) {
+      const decoded = decodeFirestoreValue(v);
+      if (decoded !== undefined) out[k] = decoded;
+    }
+    return out;
+  }
+  return undefined;
+}
+
+/**
+ * Lee una colección completa de Firestore usando la REST API paginada (evita streams gRPC en Node).
+ */
+async function fetchCollectionViaRest(projectId, collectionName, apiKey) {
+  const docs = [];
+  let pageToken = '';
+  do {
+    const params = new URLSearchParams({ pageSize: '300' });
+    if (pageToken) params.set('pageToken', pageToken);
+    if (apiKey) params.set('key', apiKey);
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      projectId
+    )}/databases/(default)/documents/${encodeURIComponent(collectionName)}?${params.toString()}`;
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(
+        `Error REST leyendo ${collectionName} en ${projectId} (${res.status}): ${errText.slice(0, 300)}`
+      );
+    }
+    const json = await res.json();
+    const list = Array.isArray(json.documents) ? json.documents : [];
+    for (const rawDoc of list) {
+      const docId = String(rawDoc.name || '').split('/').pop() || '';
+      const data = {};
+      for (const [fieldKey, fieldVal] of Object.entries(rawDoc.fields || {})) {
+        const decoded = decodeFirestoreValue(fieldVal);
+        if (decoded !== undefined) data[fieldKey] = decoded;
+      }
+      docs.push({ id: docId, data });
+    }
+    pageToken = json.nextPageToken || '';
+  } while (pageToken);
+
+  return docs;
+}
+
 function buildFirebaseConfig(envMap, prefix) {
   const get = (suffix) => envMap[`${prefix}_${suffix}`] || process.env[`${prefix}_${suffix}`] || '';
   return {
@@ -358,23 +422,20 @@ async function main() {
     productsRaw = snapJson.products || [];
     console.log(`Fuente JSON cargada: ${cli.fromJson}`);
   } else {
-    if (!v1Config.apiKey || !v1Config.projectId) {
-      console.error('Faltan credenciales de origen v1 (V1_FIREBASE_API_KEY, V1_FIREBASE_PROJECT_ID, etc. en .env.v1 o env).');
+    if (!v1Config.projectId) {
+      console.error('Faltan credenciales de origen v1 (V1_FIREBASE_PROJECT_ID en .env.v1 o env).');
       process.exit(1);
     }
-    console.log(`Leyendo SOLO LECTURA desde Firebase v1 (${v1Config.projectId})...`);
-    const v1App = initializeApp(v1Config, 'v1-readonly-source');
-    const v1Db = getFirestore(v1App);
-
-    const [branchesSnap, companySnap, productsSnap] = await Promise.all([
-      getDocs(collection(v1Db, 'branches')),
-      getDocs(collection(v1Db, 'company_info')),
-      getDocs(collection(v1Db, 'products')),
+    console.log(`Leyendo SOLO LECTURA vía REST desde Firebase v1 (${v1Config.projectId})...`);
+    const [branchesDocs, companyDocs, productsDocs] = await Promise.all([
+      fetchCollectionViaRest(v1Config.projectId, 'branches', v1Config.apiKey),
+      fetchCollectionViaRest(v1Config.projectId, 'company_info', v1Config.apiKey),
+      fetchCollectionViaRest(v1Config.projectId, 'products', v1Config.apiKey),
     ]);
 
-    branchesRaw = branchesSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
-    companyRaw = companySnap.docs.map((d) => ({ id: d.id, data: d.data() }));
-    productsRaw = productsSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+    branchesRaw = branchesDocs;
+    companyRaw = companyDocs;
+    productsRaw = productsDocs;
   }
 
   if (cli.limit > 0) {
@@ -433,7 +494,7 @@ async function main() {
     console.warn('⚠️ Sin V2_ADMIN_EMAIL/V2_ADMIN_PASSWORD: las reglas estrictas bloquearán la escritura si no existe sesión SuperAdmin.');
   }
 
-  const v2Db = getFirestore(v2App);
+  const v2Db = initializeFirestore(v2App, { experimentalForceLongPolling: true });
   const ops = [
     ...branchesRaw.map((b) => ({ collection: 'branches', docId: b.id, data: b.data })),
     ...companyRaw.map((c) => ({ collection: 'company_info', docId: c.id, data: c.data })),
