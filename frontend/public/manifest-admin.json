@@ -1,0 +1,44 @@
+{
+  "name": "KataloG Admin",
+  "short_name": "KataloG Admin",
+  "description": "Panel de Administración e Inventario - KataloG",
+  "start_url": "/admin/inventory",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#3C5866",
+  "theme_color": "#3C5866",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Panel de Administración",
+      "short_name": "Admin",
+      "description": "Gestión de inventarios y referencias",
+      "url": "/admin/inventory",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Catálogo Costa Rica",
+      "short_name": "Costa Rica",
+      "description": "Ver catálogo de Costa Rica",
+      "url": "/v/costarica",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

@@ -1,0 +1,459 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { initializeApp } from 'firebase/app';
+import {
+  getFirestore,
+  collection,
+  getDocs,
+  writeBatch,
+  doc,
+} from 'firebase/firestore';
+import { getAuth, signInWithEmailAndPassword } from 'firebase/auth';
+
+const FORBIDDEN_PUBLIC_KEYS = new Set([
+  'prices',
+  'unit',
+  'dozen',
+  'wholesale',
+  'basePrice',
+  'customLists',
+  'special',
+]);
+
+/**
+ * Parsea un archivo .env simple sin dependencias externas.
+ */
+export function parseEnvFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return {};
+  const content = fs.readFileSync(filePath, 'utf8');
+  const out = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eqIdx = line.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = line.slice(0, eqIdx).trim();
+    let val = line.slice(eqIdx + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (key) out[key] = val;
+  }
+  return out;
+}
+
+/**
+ * Elimina recursivamente propiedades `undefined` para escritura segura en Firestore.
+ */
+export function stripUndefinedDeep(obj) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) {
+    return obj.map(stripUndefinedDeep).filter((v) => v !== undefined);
+  }
+  const clean = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined) continue;
+    const cleanedVal = stripUndefinedDeep(v);
+    if (cleanedVal !== undefined) {
+      clean[k] = cleanedVal;
+    }
+  }
+  return clean;
+}
+
+function normalizePriceNumber(val, fallback = 0) {
+  const num = Number(val);
+  return Number.isFinite(num) && num >= 0 ? num : fallback;
+}
+
+function enrichPricesObject(prices) {
+  const raw = prices && typeof prices === 'object' ? prices : {};
+  const unit = normalizePriceNumber(raw.unit, 0);
+  const dozen = normalizePriceNumber(raw.dozen, 0);
+  const wholesale = normalizePriceNumber(raw.wholesale, 0);
+  const existingBase = normalizePriceNumber(raw.basePrice, 0);
+  const basePrice =
+    existingBase > 0
+      ? existingBase
+      : wholesale > 0
+      ? wholesale
+      : dozen > 0
+      ? dozen
+      : unit;
+
+  const out = {
+    unit,
+    dozen,
+    wholesale,
+    basePrice: basePrice > 0 ? basePrice : undefined,
+    special: raw.special !== undefined ? normalizePriceNumber(raw.special, 0) : undefined,
+    customLists:
+      raw.customLists && typeof raw.customLists === 'object' ? raw.customLists : undefined,
+  };
+  return stripUndefinedDeep(out);
+}
+
+/**
+ * Transforma un producto v1 al esquema v2 preservando precios y definiendo `basePrice`.
+ */
+export function transformProductForV2(docId, rawData) {
+  const now = new Date().toISOString();
+  const data = rawData && typeof rawData === 'object' ? rawData : {};
+
+  let cleanedOverrides;
+  if (data.branchOverrides && typeof data.branchOverrides === 'object') {
+    cleanedOverrides = {};
+    for (const [branchKey, overrideVal] of Object.entries(data.branchOverrides)) {
+      if (!overrideVal || typeof overrideVal !== 'object') continue;
+      cleanedOverrides[branchKey] = stripUndefinedDeep({
+        ...overrideVal,
+        prices: overrideVal.prices ? enrichPricesObject(overrideVal.prices) : undefined,
+      });
+    }
+  }
+
+  return stripUndefinedDeep({
+    id: data.id || docId,
+    tenantId: data.tenantId,
+    sku: String(data.sku || docId),
+    name: String(data.name || 'Producto'),
+    category: String(data.category || 'General'),
+    categories: Array.isArray(data.categories) ? data.categories : undefined,
+    size: data.size,
+    filledWeight:
+      data.filledWeight !== undefined && data.filledWeight !== null
+        ? Number(data.filledWeight)
+        : undefined,
+    stock: Number.isFinite(Number(data.stock)) ? Number(data.stock) : 0,
+    status: data.status || 'active',
+    prices: enrichPricesObject(data.prices),
+    originalImageUrl: data.originalImageUrl,
+    processedImageUrl: String(data.processedImageUrl || ''),
+    tags: Array.isArray(data.tags) ? data.tags : [],
+    branchOverrides: cleanedOverrides,
+    createdAt: data.createdAt || now,
+    updatedAt: data.updatedAt || now,
+  });
+}
+
+/**
+ * Verifica recursivamente que ningún documento público contenga precios o campos comerciales.
+ */
+export function validateNoPricesInPublicDoc(publicDoc) {
+  const walk = (node, currentPath) => {
+    if (node === null || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach((item, idx) => walk(item, `${currentPath}[${idx}]`));
+      return;
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (FORBIDDEN_PUBLIC_KEYS.has(k)) {
+        throw new Error(
+          `Violación de privacidad en catalog_public (${publicDoc.id}): campo prohibido "${currentPath}.${k}"`
+        );
+      }
+      walk(v, `${currentPath}.${k}`);
+    }
+  };
+  walk(publicDoc, 'root');
+  return true;
+}
+
+/**
+ * Construye el documento de `catalog_public` completamente desprovisto de precios.
+ */
+export function buildPublicCatalogDoc(v2Product) {
+  let publicOverrides;
+  if (v2Product.branchOverrides && typeof v2Product.branchOverrides === 'object') {
+    publicOverrides = {};
+    for (const [branchKey, override] of Object.entries(v2Product.branchOverrides)) {
+      if (!override || typeof override !== 'object') continue;
+      publicOverrides[branchKey] = stripUndefinedDeep({
+        stock: override.stock,
+        status: override.status,
+        filledWeight: override.filledWeight,
+      });
+    }
+  }
+
+  const publicDoc = stripUndefinedDeep({
+    id: v2Product.id,
+    tenantId: v2Product.tenantId,
+    sku: v2Product.sku,
+    name: v2Product.name,
+    category: v2Product.category,
+    categories: v2Product.categories,
+    size: v2Product.size,
+    filledWeight: v2Product.filledWeight,
+    stock: v2Product.stock,
+    status: v2Product.status,
+    processedImageUrl: v2Product.processedImageUrl || '',
+    tags: v2Product.tags || [],
+    branchOverrides: publicOverrides,
+    createdAt: v2Product.createdAt,
+    updatedAt: v2Product.updatedAt,
+  });
+
+  validateNoPricesInPublicDoc(publicDoc);
+  return publicDoc;
+}
+
+/**
+ * Genera los documentos iniciales de `price_lists` por sucursal.
+ */
+export function buildDefaultPriceListsForBranches(branches) {
+  const now = new Date().toISOString();
+  const slugs = new Set(['costarica']);
+  if (Array.isArray(branches)) {
+    for (const b of branches) {
+      if (b?.slug) slugs.add(String(b.slug).trim());
+    }
+  }
+
+  const docs = [];
+  for (const branchSlug of slugs) {
+    docs.push(
+      {
+        docId: `${branchSlug}_unit`,
+        data: {
+          id: 'unit',
+          name: 'Unidad',
+          branchSlug,
+          mode: 'manual',
+          isActive: true,
+          sortOrder: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      {
+        docId: `${branchSlug}_dozen`,
+        data: {
+          id: 'dozen',
+          name: 'Docena',
+          branchSlug,
+          mode: 'manual',
+          minUnits: 12,
+          isActive: true,
+          sortOrder: 2,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      {
+        docId: `${branchSlug}_wholesale`,
+        data: {
+          id: 'wholesale',
+          name: 'Mayorista',
+          branchSlug,
+          mode: 'manual',
+          minUnits: 12,
+          isActive: true,
+          isDefaultForSeller: true,
+          sortOrder: 3,
+          createdAt: now,
+          updatedAt: now,
+        },
+      }
+    );
+  }
+  return docs;
+}
+
+/**
+ * Garantiza que nunca se apunte la escritura sobre el proyecto v1 de producción.
+ */
+export function assertV1IsNotV2(v1Config, v2Config) {
+  if (!v2Config?.projectId) {
+    throw new Error('Falta NEXT_PUBLIC_FIREBASE_PROJECT_ID / V2_FIREBASE_PROJECT_ID para destino v2.');
+  }
+  if (v1Config?.projectId && v1Config.projectId === v2Config.projectId) {
+    throw new Error(
+      `Abortando: v1 (${v1Config.projectId}) y v2 (${v2Config.projectId}) apuntan al mismo proyecto Firebase.`
+    );
+  }
+}
+
+function buildFirebaseConfig(envMap, prefix) {
+  const get = (suffix) => envMap[`${prefix}_${suffix}`] || process.env[`${prefix}_${suffix}`] || '';
+  return {
+    apiKey: get('API_KEY'),
+    authDomain: get('AUTH_DOMAIN'),
+    projectId: get('PROJECT_ID'),
+    storageBucket: get('STORAGE_BUCKET'),
+    messagingSenderId: get('MESSAGING_SENDER_ID'),
+    appId: get('APP_ID'),
+  };
+}
+
+function parseCliArgs(argv) {
+  const args = {
+    dryRun: false,
+    limit: 0,
+    v1EnvPath: '',
+    v2EnvPath: '',
+    fromJson: '',
+    exportSnapshot: '',
+    confirmWrite: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === '--dry-run') args.dryRun = true;
+    else if (token === '--confirm-write') args.confirmWrite = true;
+    else if (token === '--limit' && argv[i + 1]) args.limit = Math.max(0, parseInt(argv[++i], 10) || 0);
+    else if (token === '--v1-env' && argv[i + 1]) args.v1EnvPath = argv[++i];
+    else if (token === '--v2-env' && argv[i + 1]) args.v2EnvPath = argv[++i];
+    else if (token === '--from-json' && argv[i + 1]) args.fromJson = argv[++i];
+    else if (token === '--export-snapshot' && argv[i + 1]) args.exportSnapshot = argv[++i];
+  }
+  return args;
+}
+
+async function commitInChunks(db, operations, label) {
+  const CHUNK_SIZE = 400;
+  let committed = 0;
+  for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+    const chunk = operations.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    for (const op of chunk) {
+      batch.set(doc(db, op.collection, op.docId), stripUndefinedDeep(op.data), { merge: true });
+    }
+    await batch.commit();
+    committed += chunk.length;
+    console.log(`  ✓ ${label}: ${committed}/${operations.length}`);
+  }
+}
+
+async function main() {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const frontendDir = path.resolve(__dirname, '..');
+  const cli = parseCliArgs(process.argv.slice(2));
+
+  const v1Env = {
+    ...parseEnvFile(path.join(frontendDir, '.env.v1')),
+    ...parseEnvFile(cli.v1EnvPath ? path.resolve(cli.v1EnvPath) : ''),
+  };
+  const v2Env = {
+    ...parseEnvFile(path.join(frontendDir, '.env.local')),
+    ...parseEnvFile(cli.v2EnvPath ? path.resolve(cli.v2EnvPath) : ''),
+  };
+
+  const v1Config = buildFirebaseConfig(v1Env, 'V1_FIREBASE');
+  const v2ConfigRaw = buildFirebaseConfig(v2Env, 'V2_FIREBASE');
+  const v2ConfigFallback = buildFirebaseConfig(v2Env, 'NEXT_PUBLIC_FIREBASE');
+  const v2Config = v2ConfigRaw.projectId ? v2ConfigRaw : v2ConfigFallback;
+
+  let branchesRaw = [];
+  let companyRaw = [];
+  let productsRaw = [];
+
+  if (cli.fromJson) {
+    const snapJson = JSON.parse(fs.readFileSync(path.resolve(cli.fromJson), 'utf8'));
+    branchesRaw = snapJson.branches || [];
+    companyRaw = snapJson.company_info || [];
+    productsRaw = snapJson.products || [];
+    console.log(`Fuente JSON cargada: ${cli.fromJson}`);
+  } else {
+    if (!v1Config.apiKey || !v1Config.projectId) {
+      console.error('Faltan credenciales de origen v1 (V1_FIREBASE_API_KEY, V1_FIREBASE_PROJECT_ID, etc. en .env.v1 o env).');
+      process.exit(1);
+    }
+    console.log(`Leyendo SOLO LECTURA desde Firebase v1 (${v1Config.projectId})...`);
+    const v1App = initializeApp(v1Config, 'v1-readonly-source');
+    const v1Db = getFirestore(v1App);
+
+    const [branchesSnap, companySnap, productsSnap] = await Promise.all([
+      getDocs(collection(v1Db, 'branches')),
+      getDocs(collection(v1Db, 'company_info')),
+      getDocs(collection(v1Db, 'products')),
+    ]);
+
+    branchesRaw = branchesSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+    companyRaw = companySnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+    productsRaw = productsSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+  }
+
+  if (cli.limit > 0) {
+    productsRaw = productsRaw.slice(0, cli.limit);
+  }
+
+  if (cli.exportSnapshot) {
+    fs.writeFileSync(
+      path.resolve(cli.exportSnapshot),
+      JSON.stringify(
+        {
+          exportedAt: new Date().toISOString(),
+          branches: branchesRaw,
+          company_info: companyRaw,
+          products: productsRaw,
+        },
+        null,
+        2
+      )
+    );
+    console.log(`Snapshot guardado en ${cli.exportSnapshot}`);
+  }
+
+  const branchObjects = branchesRaw.map((b) => b.data);
+  const transformedProducts = productsRaw.map((p) => transformProductForV2(p.id, p.data));
+  const publicDocs = transformedProducts.map((p) => buildPublicCatalogDoc(p));
+  const defaultPriceLists = buildDefaultPriceListsForBranches(branchObjects);
+
+  console.log('\n--- RESUMEN DE TRANSFORMACIÓN V1 -> V2 ---');
+  console.log(`  branches:       ${branchesRaw.length}`);
+  console.log(`  company_info:   ${companyRaw.length}`);
+  console.log(`  products (priv):${transformedProducts.length}`);
+  console.log(`  catalog_public: ${publicDocs.length} (validados: 0 campos de precio)`);
+  console.log(`  price_lists:    ${defaultPriceLists.length}`);
+
+  if (transformedProducts[0]) {
+    console.log('\nMuestra product v2:', JSON.stringify(transformedProducts[0], null, 2).slice(0, 450));
+    console.log('\nMuestra catalog_public:', JSON.stringify(publicDocs[0], null, 2).slice(0, 450));
+  }
+
+  if (cli.dryRun || !cli.confirmWrite) {
+    console.log('\n[DRY-RUN] No se realizaron escrituras. Usa `--confirm-write` para escribir en v2.');
+    process.exit(0);
+  }
+
+  assertV1IsNotV2(v1Config, v2Config);
+  const adminEmail = process.env.V2_ADMIN_EMAIL || v2Env.V2_ADMIN_EMAIL || '';
+  const adminPassword = process.env.V2_ADMIN_PASSWORD || v2Env.V2_ADMIN_PASSWORD || '';
+
+  const v2App = initializeApp(v2Config, 'v2-target');
+  const v2Auth = getAuth(v2App);
+  if (adminEmail && adminPassword) {
+    console.log(`Autenticando SuperAdmin destino (${adminEmail})...`);
+    await signInWithEmailAndPassword(v2Auth, adminEmail, adminPassword);
+  } else {
+    console.warn('⚠️ Sin V2_ADMIN_EMAIL/V2_ADMIN_PASSWORD: las reglas estrictas bloquearán la escritura si no existe sesión SuperAdmin.');
+  }
+
+  const v2Db = getFirestore(v2App);
+  const ops = [
+    ...branchesRaw.map((b) => ({ collection: 'branches', docId: b.id, data: b.data })),
+    ...companyRaw.map((c) => ({ collection: 'company_info', docId: c.id, data: c.data })),
+    ...defaultPriceLists.map((pl) => ({ collection: 'price_lists', docId: pl.docId, data: pl.data })),
+    ...transformedProducts.map((p) => ({ collection: 'products', docId: p.id, data: p })),
+    ...publicDocs.map((pub) => ({ collection: 'catalog_public', docId: pub.id, data: pub })),
+  ];
+
+  console.log(`\nEscribiendo ${ops.length} documentos en Firebase v2 (${v2Config.projectId})...`);
+  await commitInChunks(v2Db, ops, 'Migración v2');
+  console.log('✓ Migración completada.');
+  process.exit(0);
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+) {
+  main().catch((err) => {
+    console.error('Error en migración:', err);
+    process.exit(1);
+  });
+}

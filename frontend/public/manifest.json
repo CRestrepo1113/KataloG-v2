@@ -1,0 +1,37 @@
+{
+  "name": "KataloG - Catálogo Digital",
+  "short_name": "KataloG",
+  "description": "Catálogo interactivo de productos - KataloG",
+  "start_url": "/v/costarica",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#3C5866",
+  "theme_color": "#3C5866",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Catálogo Costa Rica",
+      "short_name": "Costa Rica",
+      "description": "Ver catálogo de Costa Rica",
+      "url": "/v/costarica",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

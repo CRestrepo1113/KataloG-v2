@@ -1,0 +1,181 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function hasClientDoc() {
+      return isSignedIn() && exists(/databases/$(database)/documents/clientes/$(request.auth.uid));
+    }
+
+    function clientData() {
+      return get(/databases/$(database)/documents/clientes/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdminEmail() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'crestrepol.kyg@gmail.com';
+    }
+
+    function isSuperAdmin() {
+      return isSuperAdminEmail()
+        || (hasClientDoc() && clientData().rol == 'superadmin');
+    }
+
+    function isApproved() {
+      return isSuperAdmin()
+        || (hasClientDoc() && clientData().estado_acceso == 'aprobado');
+    }
+
+    function isBranchAdmin() {
+      return hasClientDoc()
+        && clientData().rol == 'admin'
+        && clientData().estado_acceso == 'aprobado';
+    }
+
+    function isAdmin() {
+      return isSuperAdmin() || isBranchAdmin();
+    }
+
+    function isSeller() {
+      return isApproved() && clientData().rol == 'vendedor';
+    }
+
+    function adminAllowsBranch(branch) {
+      return isSuperAdmin()
+        || (isBranchAdmin()
+          && (
+            (clientData().assigned_branches is list && branch in clientData().assigned_branches)
+            || clientData().sucursal == branch
+          ));
+    }
+
+    // =========================================================================
+    // 1. PROYECCIÓN PÚBLICA DEL CATÁLOGO (Cero precios, lectura pública)
+    // =========================================================================
+    match /catalog_public/{docId} {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && !('prices' in request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 2. CONFIGURACIÓN PÚBLICA DE SUCURSALES Y EMPRESA
+    // =========================================================================
+    match /branches/{branchId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    match /company_info/{companyId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // =========================================================================
+    // 3. PRODUCTOS MAESTROS Y LISTAS DE PRECIOS (Solo usuarios aprobados)
+    // =========================================================================
+    match /products/{productId} {
+      allow read: if isApproved();
+      allow write: if isAdmin();
+    }
+
+    match /price_lists/{listId} {
+      allow read: if isApproved();
+      allow create, update: if isAdmin() && adminAllowsBranch(request.resource.data.branchSlug);
+      allow delete: if isAdmin() && adminAllowsBranch(resource.data.branchSlug);
+    }
+
+    // =========================================================================
+    // 4. CLIENTES Y PERFILES (Anti-escalamiento estricto)
+    // =========================================================================
+    match /clientes/{clientId} {
+      allow read: if isSuperAdmin()
+        || (isSignedIn() && request.auth.uid == clientId)
+        || (isSignedIn() && resource.data.uid == request.auth.uid)
+        || (isBranchAdmin() && adminAllowsBranch(resource.data.sucursal))
+        || (isSeller()
+          && resource.data.sucursal == clientData().sucursal
+          && resource.data.get('rol', 'cliente') in ['cliente', 'emprendedor']);
+
+      // Creación propia desde catálogo: forzar estado pendiente, rol cliente, sin listas ni marca blanca
+      allow create: if isSuperAdmin()
+        || (isBranchAdmin()
+          && adminAllowsBranch(request.resource.data.sucursal)
+          && request.resource.data.get('rol', 'cliente') in ['cliente', 'emprendedor', 'vendedor'])
+        || (isSignedIn()
+          && request.auth.uid == clientId
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.rol == 'cliente'
+          && request.resource.data.estado_acceso == 'pendiente'
+          && (!('whiteLabelEnabled' in request.resource.data) || request.resource.data.whiteLabelEnabled == false)
+          && (!('allowedPriceLists' in request.resource.data) || request.resource.data.allowedPriceLists.size() == 0)
+          && (!('assigned_branches' in request.resource.data) || request.resource.data.assigned_branches.size() == 0));
+
+      // Actualización propia: prohibido alterar rol, estado_acceso, listas, marca blanca o saldo
+      allow update: if isSuperAdmin()
+        || (isBranchAdmin()
+          && adminAllowsBranch(resource.data.sucursal)
+          && adminAllowsBranch(request.resource.data.sucursal)
+          && !(resource.data.get('rol', 'cliente') in ['admin', 'superadmin'])
+          && request.resource.data.get('rol', 'cliente') in ['cliente', 'emprendedor', 'vendedor']
+          && request.resource.data.get('assigned_branches', []) == resource.data.get('assigned_branches', []))
+        || (isSignedIn()
+          && (request.auth.uid == clientId || resource.data.uid == request.auth.uid)
+          && request.resource.data.get('rol', 'cliente') == resource.data.get('rol', 'cliente')
+          && request.resource.data.get('estado_acceso', 'pendiente') == resource.data.get('estado_acceso', 'pendiente')
+          && request.resource.data.get('whiteLabelEnabled', false) == resource.data.get('whiteLabelEnabled', false)
+          && request.resource.data.get('allowedPriceLists', []) == resource.data.get('allowedPriceLists', [])
+          && request.resource.data.get('subscriptionStatus', 'none') == resource.data.get('subscriptionStatus', 'none')
+          && request.resource.data.get('assigned_branches', []) == resource.data.get('assigned_branches', [])
+          && request.resource.data.get('saldo', 0) == resource.data.get('saldo', 0));
+
+      allow delete: if isSuperAdmin()
+        || (isBranchAdmin()
+          && adminAllowsBranch(resource.data.sucursal)
+          && !(resource.data.get('rol', 'cliente') in ['admin', 'superadmin']));
+    }
+
+    // =========================================================================
+    // 5. SOLICITUDES DE ACCESO / AMPLIACIÓN DE LISTAS
+    // =========================================================================
+    match /access_requests/{reqId} {
+      allow read: if isSuperAdmin()
+        || (isSignedIn() && resource.data.uid == request.auth.uid)
+        || (isBranchAdmin() && adminAllowsBranch(resource.data.sucursal));
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.estado == 'pendiente';
+
+      allow update, delete: if isSuperAdmin()
+        || (isBranchAdmin() && adminAllowsBranch(resource.data.sucursal));
+    }
+
+    // =========================================================================
+    // 6. PEDIDOS Y METADATOS
+    // =========================================================================
+    match /pedidos/{orderId} {
+      allow read: if isSuperAdmin()
+        || (isBranchAdmin() && adminAllowsBranch(resource.data.sucursal))
+        || (isSignedIn() && (resource.data.cliente_id == request.auth.uid || resource.data.vendedor_id == request.auth.uid));
+
+      allow create: if isApproved()
+        && (isSuperAdmin()
+          || (isBranchAdmin() && adminAllowsBranch(request.resource.data.sucursal))
+          || (isSeller() && request.resource.data.vendedor_id == request.auth.uid)
+          || request.resource.data.cliente_id == request.auth.uid);
+
+      allow update, delete: if isSuperAdmin()
+        || (isBranchAdmin() && adminAllowsBranch(resource.data.sucursal));
+    }
+
+    match /metadatos/{metaId} {
+      allow read, write: if isApproved();
+    }
+  }
+}

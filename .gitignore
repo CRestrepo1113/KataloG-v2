@@ -1,0 +1,49 @@
+# Node & Frontend dependencies
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.tsbuildinfo
+*.pem
+.vercel/
+.firebase/
+
+# Python & Backend
+__pycache__/
+backend/app/__pycache__/
+backend/app/services/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environment variables
+.env
+.env.local
+.env.v1
+.env.development.local
+.env.test.local
+.env.production.local
+backend/.env
+frontend/.env.local
+frontend/.env.v1
+*.v1.json
+
+# Logs and Debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary & Test files
+test_*.png
+.DS_Store
+Thumbs.db
+backups/
+frontend/backups/
